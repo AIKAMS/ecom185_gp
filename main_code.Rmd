@@ -1,0 +1,118 @@
+---
+title: "Youth Unemployment and National Living Wage policy in the UK"
+output: html_notebook
+---
+
+Setup
+```{r}
+library(did)
+library(fixest)
+library(tidyverse)
+library(haven)
+library(dplyr)
+library(ggplot2)
+library(rdrobust)
+
+## load data
+data14 <- read_dta("data_rest/apsp_jd14_eul_pwta18.dta")
+data15 <- read_dta("data_rest/apsp_jd15_eul_pwta18.dta")
+data16 <- read_dta("data_rest/apsp_jd16_eul_pwta18.dta")
+data17 <- read_dta("data_rest/apsp_jd17_eul_pwta18.dta")
+data18 <- read_dta("data_rest/apsp_jd18_eul_pwta18.dta")
+data19 <- read_dta("data_rest/apsp_jd19_eul_pwta18.dta")
+data20 <- read_dta("data_rest/apsp_jd20_eul_pwta22.dta")
+data21 <- read_dta("data_rest/apsp_jd21_eul_pwta22.dta")
+data22 <- read_dta("data_rest/apsp_jd22_eul_pwta22.dta")
+data23 <- read_dta("data_rest/apsp_jd23_eul_pwta22.dta")
+data24 <- read_dta("data_rest/apsp_jd24_eul_pwta22.dta")
+
+# Define read_table()# Define vector of years
+years <- 14:24
+
+# Define subsetting function
+subset_APS <- function(df, year) {
+  # Define desired variables and fallback names
+  var_map <- c(
+    AGE = "age",
+    AGEP = "age",
+    SEX = "sex",
+    ILODEFR = "emp",
+    ACTHR = "hours",
+    GRSSWK = "pay",
+    HOURPAY = "hourly_pay",
+    HPAYW = "hourly_pay",
+    REFDTE = "ref_date",
+    ETHGR11 = "ethnicity",
+    ETHGR3 = "ethnicity",
+    ETHUKEUL = "ethnicity",
+    PWTA20 = "weight",
+    PWTA16 = "weight",
+    PWTA14 = "weight",
+    PWTA22 = "weight",
+    PWTA18 = "weight"
+  )
+  
+  # Keep only variables that exist in the dataset
+  available_vars <- intersect(names(var_map), names(df))
+  
+  df %>%
+    select(all_of(available_vars)) %>%
+    rename_with(~ var_map[.x], .cols = everything()) %>%
+    filter(age >= 19, age <= 25) %>%
+    mutate(year = 2000 + year)
+}
+
+
+# Apply to all loaded datasets
+aps_panel <- bind_rows(lapply(years, function(y) {
+  df_name <- paste0("data", y)
+  subset_APS(get(df_name), y)
+}))
+
+# clean data
+aps_panel[] <- lapply(aps_panel, function(x) {
+  if (is.numeric(x)) ifelse(x < 0, NA, x) else x
+})
+```
+
+# sorting cohorts
+aps_subset <- aps_panel %>% filter(age >= 19, age <= 24)
+
+aps_subset <- aps_subset %>%
+  mutate(
+    treatment_group = case_when(
+      age %in% 19:20 ~ "control",
+      age %in% 23:24 ~ "treated_23",
+      age %in% 21:22 ~ "treated_21",
+      TRUE ~ NA_character_
+    )
+  )
+
+```
+
+Parallel Trends plot
+```{r}
+avg_trends <- aps_subset %>%
+  group_by(year, treatment_group) %>%
+  summarise(mean_outcome = mean(pay, na.rm = TRUE), .groups = "drop")
+
+ggplot(avg_trends, aes(x = year, y = mean_outcome, color = treatment_group)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  labs(
+    title = "Parallel Trends: Mean Pay by Group",
+    x = "Year",
+    y = "Mean Pay",
+    color = "Group"
+  ) +
+  theme_minimal()
+```
+
+Policy Variables
+
+```{r}
+
+
+
+```
+

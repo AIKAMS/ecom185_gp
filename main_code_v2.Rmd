@@ -1,0 +1,326 @@
+---
+title: "National Living Wage: Causal Impact of Age‑Eligibility Thresholds"
+author: "Group X"
+output: html_document
+---
+
+```{r setup, message = FALSE, warning = FALSE}
+# ---- Packages ----
+packages <- c(
+  "tidyverse",   # data management & ggplot2
+  "lubridate",   # dates
+  "fixest",      # DiD / fixed‑effects
+  "rdrobust",    # sharp RDD
+  "patchwork"    # combine plots
+)
+
+invisible(lapply(packages, function(p) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)))
+lapply(packages, library, character.only = TRUE)
+
+# ---- Parameters ----
+data_dir   <- "data_rest"          # folder containing APS .dta files
+survey_yrs <- 14:24                # APS years 2014‑2024
+
+# helper to define weight var present in each year
+weight_vars <- c("PWTA14", "PWTA16", "PWTA18", "PWTA20", "PWTA22")
+
+# ---- Variable map ----
+var_map <- c(
+  AGE      = "age",     AGEP      = "age",
+  SEX      = "sex",
+  ILODEFR  = "emp_status",
+  REFDTE   = "ref_date",
+  ETHGR11  = "ethnicity", ETHGR3   = "ethnicity", ETHUKEUL = "ethnicity",
+  GOR      = "region",   CTRY9D    = "region"
+)
+```
+
+## 1. Load & Tidy APS Waves
+
+```{r load-clean}
+clean_wave <- function(year) {
+  file <- list.files(data_dir, pattern = paste0("apsp_jd", year, "_.*\\.dta$"), full.names = TRUE)
+  if (length(file) == 0) {
+    warning(paste("File for", year, "not found")); return(tibble())
+  }
+
+  df <- read_dta(file)
+  
+  # keep only variables we know about incl. weights
+  vars_keep <- intersect(names(df), c(names(var_map), weight_vars))
+  df <- df %>% select(all_of(vars_keep))
+
+  # rename core vars
+  df <- df %>% rename_with(~ var_map[.x], .cols = names(var_map)[names(var_map) %in% names(df)])
+
+  # unify weight column
+  wt_name <- intersect(weight_vars, names(df))[1]
+  df <- df %>% rename(weight = {{wt_name}})
+
+  # derive variables
+  df %>% mutate(
+    year        = 2000 + year,
+    unemployed  = case_when(emp_status == 2 ~ 1L, emp_status %in% c(1, 3) ~ 0L),
+    inactive    = case_when(emp_status == 3 ~ 1L, emp_status %in% c(1, 2) ~ 0L),
+    age         = as.numeric(age),
+    survey_date = dmy(ref_date)
+  ) %>%
+    # filter ages around policy windows (18‑65)
+    filter(between(age, 18, 65), !is.na(unemployed), !is.na(weight), !is.na(survey_date))
+}
+
+aps <- map_dfr(survey_yrs, clean_wave)
+# clean negative codes in numeric columns
+aps <- aps %>% mutate(across(where(is.numeric), ~ ifelse(.x < 0, NA, .x)))
+
+aps <- aps %>% mutate(ym = format(survey_date, "%Y-%m"))  # year-month factor
+
+cat("Combined observations:", nrow(aps),"\n")
+```
+
+## 2. Policy Timeline & Treatment Flags
+
+```{r policy-flags}
+policy_timeline <- tribble(
+  ~reform,      ~age_threshold, ~implementation,
+  "NLW_2016",          25,      ymd("2016‑04‑01"),
+  "NLW_2021",          23,      ymd("2021‑04‑01"),
+  "NLW_2024",          21,      ymd("2024‑04‑01")
+)
+
+aps <- aps %>% mutate(
+  post_2016 = as.integer(survey_date >= ymd("2016‑04‑01")),
+  post_2021 = as.integer(survey_date >= ymd("2021‑04‑01")),
+  post_2024 = as.integer(survey_date >= ymd("2024‑04‑01")),
+
+  age_25p   = as.integer(age >= 25),
+  age_23p   = as.integer(age >= 23),
+  age_21p   = as.integer(age >= 21),
+
+  treat_2016 = post_2016 * age_25p,
+  treat_2021 = post_2021 * age_23p,
+  treat_2024 = post_2024 * age_21p,
+
+  age_run25 = age - 25,
+  age_run23 = age - 23,
+  age_run21 = age - 21
+)
+```
+
+## 3. Exploratory Visualisations
+
+### Survey Timing vs. Age
+
+```{r viz-age-survey}
+ggplot(aps, aes(x = survey_date, y = age)) +
+  geom_hex(bins = 40) +
+  geom_vline(data = policy_timeline, aes(xintercept = implementation), colour = "red", linetype = "dashed") +
+  labs(title = "APS interviews by Age and Date", x = "Survey date", y = "Age")
+```
+
+### Unemployment Rate around Threshold
+
+### Pre/post 2016
+
+```{r viz-1}
+plot_rdd <- function(data, cut_age, post_var, title) {
+  ggplot(data, aes(x = age - cut_age, y = unemployed)) +
+    stat_summary_bin(bins = 20, fun = mean) +
+    geom_vline(xintercept = 0, colour = "red", linetype = "dotted") +
+    facet_wrap(vars({{post_var}}), labeller = as_labeller(c("0"="Pre","1"="Post"))) +
+    labs(title = title, x = "Age relative to threshold", y = "Unemployment rate")
+}
+
+plot_rdd(aps %>% filter(between(age,18, 30)), 25, post_2016, "Visualisation: 2016 threshold (Age 25)")
+```
+
+### Pre/post 2021
+
+```{r viz-2}
+plot_rdd <- function(data, cut_age, post_var, title) {
+  ggplot(data, aes(x = age - cut_age, y = unemployed)) +
+    stat_summary_bin(bins = 20, fun = mean) +
+    geom_vline(xintercept = 0, colour = "red", linetype = "dotted") +
+    facet_wrap(vars({{post_var}}), labeller = as_labeller(c("0"="Pre","1"="Post"))) +
+    labs(title = title, x = "Age relative to threshold", y = "Unemployment rate")
+}
+
+plot_rdd(aps %>% filter(between(age, 18, 30)), 23, post_2021, "Visualisation: 2021 threshold (Age 23)")
+```
+
+### Pre/post 2021
+
+```{r viz-3}
+plot_rdd <- function(data, cut_age, post_var, title) {
+  ggplot(data, aes(x = age - cut_age, y = unemployed)) +
+    stat_summary_bin(bins = 20, fun = mean) +
+    geom_vline(xintercept = 0, colour = "red", linetype = "dotted") +
+    facet_wrap(vars({{post_var}}), labeller = as_labeller(c("0"="Pre","1"="Post"))) +
+    labs(title = title, x = "Age relative to threshold", y = "Unemployment rate")
+}
+
+plot_rdd(aps %>% filter(between(age, 18, 30)), 21, post_2024, "Visualisation: 2024 threshold (Age 21)")
+```
+
+## 4. Difference‑in‑Differences
+
+**4.1 DiD unemployment with basic controls**
+
+```{r did-est}
+
+# using the : to keep the DiD term only since age as IV is collinear with age_25p
+did_2016 <- feols(unemployed ~ post_2016:age_25p |
+                  age + ym, data = aps, weights = ~weight, cluster = ~ym
+                  ) 
+summary(did_2016)
+
+
+# repeat for the main 2021 age reduction
+did_2021 <- feols(unemployed ~ post_2021:age_23p |
+                  age + ym, data = aps, weights = ~weight, cluster = ~ym
+                  )
+summary(did_2021)
+
+# repeat for the 2024 further reduction
+did_2024 <- feols(unemployed ~ post_2024:age_21p |
+                  age + ym, data = aps, weights = ~weight, cluster = ~ym
+                  )
+summary(did_2024)
+
+```
+
+**4.2 DiD unemployment with extra controls (sex, ethnicity and region)**
+
+No significant impact on age categories beyond 2016 introduction which suggests unemployment increased for NWL cohorts compared to age groups below the threshold.
+
+#TODO: review this section, use other group closer to 25 year-olds as affected groups, review cluster applicability, etc.
+
+```{r did-est-2}
+
+did_2016 <- feols(unemployed ~ post_2016:age_25p |
+                  age + ym + sex + ethnicity + region,
+                  data = aps, weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2016)
+
+# repeat for the main 2021 age reduction
+did_2021 <- feols(unemployed ~ post_2021:age_23p |
+                  age + ym + sex + ethnicity + region,
+                  data = aps, weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2021)
+
+# repeat for the 2024 further reduction
+did_2024 <- feols(unemployed ~ post_2024:age_21p |
+                  age + ym + sex + ethnicity + region,
+                  data = aps, weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2024)
+
+```
+
+**4.3 DiD inactivity with basic controls**
+
+If spec is correct, increase in NLW appears to have reduced economic inactivity for 2016 and 2021, 2024 events.
+
+```{r did-est-3}
+
+# using the : to keep the DiD term only since age as IV is collinear with age_25p
+did_2016 <- feols(inactive ~ post_2016:age_25p |
+                  age + ym, data = aps, weights = ~weight, cluster = ~ym
+                  ) 
+summary(did_2016)
+
+
+# repeat for the main 2021 age reduction
+did_2021 <- feols(inactive ~ post_2021:age_23p | 
+                  age + ym, data = aps, weights = ~weight, cluster = ~ym
+                  )
+summary(did_2021)
+
+# repeat for the 2024 further reduction
+did_2024 <- feols(inactive ~ post_2024:age_21p | 
+                  age + ym, data = aps, weights = ~weight, cluster = ~ym
+                  )
+summary(did_2024)
+```
+
+**4.4 DiD inactivity with extra controls**
+
+Similar results with extra controls in place and two way clustered standard errors around year-month and age.
+
+```{r did-est-4}
+
+did_2016 <- feols(inactive ~ post_2016:age_25p |
+                  age + ym + sex + ethnicity + region,
+                  data = aps, weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2016)
+
+# repeat for the main 2021 age reduction
+did_2021 <- feols(inactive ~ post_2021:age_23p |
+                  age + ym + sex + ethnicity + region,
+                  data = aps, weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2021)
+
+# repeat for the 2024 further reduction
+did_2024 <- feols(inactive ~ post_2024:age_21p |
+                  age + ym + sex + ethnicity + region,
+                  data = aps, weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2024)
+
+```
+
+## 5. Event study Estimates (WiP)
+
+(I think I did this wrong)
+
+```{r event-est}
+
+## Event-study around the 2016 cut-off
+aps <- aps %>% 
+  mutate(month_rel = floor(time_length(
+    survey_date - as.Date("2016-04-01"), "month")
+    )
+  )
+
+es_2016 <- feols(
+  unemployed ~ i(month_rel, age_25p, ref = -1) | age + ym,
+  data     = aps %>% filter(between(month_rel, -24, 24)),
+  weights  = ~weight,
+  cluster  = ~ym
+)
+
+iplot(es_2016, ref.line = 0,
+      xlab = "Months relative to Apr-2016",
+      main = "Event-study: unemployment gap 25+ vs <25")
+
+
+```
+
+## 6. Sharp RDD Estimates (WiP)
+
+```{r rdd-est}
+rdd_2016 <- rdrobust(y = aps$unemployed, x = aps$age_run25, c = 0,  masspoints = "adjust")
+print(rdd_2016$coef)  # Treatment effect at age 25 in 2016 regime
+
+```
+
+Repeat for later reforms:
+
+```{r rdd-loop, eval=FALSE}
+rdd_res <- list(
+  `2016` = rdrobust(aps$unemployed, aps$age_run25, c = 0, subset = aps$survey_date >= ymd("2015‑04‑01") & aps$survey_date < ymd("2017‑04‑01")),
+  `2021` = rdrobust(aps$unemployed, aps$age_run23, c = 0, subset = aps$survey_date >= ymd("2020‑04‑01") & aps$survey_date < ymd("2022‑04‑01")),
+  `2024` = rdrobust(aps$unemployed, aps$age_run21, c = 0, subset = aps$survey_date >= ymd("2023‑04‑01") & aps$survey_date < ymd("2025‑04‑01"))
+)
+map(rdd_res, ~ .x$coef)
+```
