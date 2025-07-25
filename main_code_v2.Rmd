@@ -75,6 +75,8 @@ aps <- aps %>% mutate(across(where(is.numeric), ~ ifelse(.x < 0, NA, .x)))
 
 aps <- aps %>% mutate(ym = format(survey_date, "%Y-%m"))  # year-month factor
 
+aps <- aps %>% filter(between(age, 19,30)) ## filter for 19-30 year olds
+
 cat("Combined observations:", nrow(aps),"\n")
 ```
 
@@ -103,9 +105,43 @@ aps <- aps %>% mutate(
 
   age_run25 = age - 25,
   age_run23 = age - 23,
-  age_run21 = age - 21
+  age_run21 = age - 21,
+
+  event_time_2016 = year - 2016,
+  event_time_2021 = year - 2021,
+  event_time_2024 = year - 2024
 )
 ```
+## 2.1 parallel trends testing
+
+aps <- aps %>%
+  mutate(
+    cohort = case_when(
+      between(age, 25, 30) ~ "25-30",
+      between(age, 23, 24) ~ "23-24",
+      between(age, 21, 22) ~ "21-22",
+      between(age, 19, 20) ~ "19-20",
+      TRUE ~ NA_character_
+    ))
+    
+# Compute average outcome by cohort and year
+avg_trends <- aps %>%
+  filter(year < 2024) %>%  # only pre-treatment
+  group_by(cohort, year) %>%
+  summarise(mean_outcome = weighted.mean(unemployed, weight, na.rm = TRUE)) %>%
+  ungroup()
+
+# Plot
+ggplot(avg_trends, aes(x = year, y = mean_outcome, color = cohort)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Parallel Trends Check (Pre-Treatment)",
+    x = "Year", y = "Unemployment rate",
+    color = "Age group"
+  ) +
+  scale_x_continuous(breaks = unique(avg_trends$year))+
+  theme_minimal()
+
 
 ## 3. Exploratory Visualisations
 
