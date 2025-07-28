@@ -1,0 +1,516 @@
+---
+title: "National Living Wage: Causal Impact of Age‑Eligibility Thresholds"
+author: "Group X"
+output: html_document
+---
+
+```{r setup, message = FALSE, warning = FALSE}
+# ---- Packages ----
+packages <- c(
+  "tidyverse",   # data management & ggplot2
+  "lubridate",   # dates
+  "fixest",      # DiD / fixed‑effects
+  "haven"        # load .dta files
+)
+
+invisible(lapply(packages, function(p) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)))
+lapply(packages, library, character.only = TRUE)
+
+# helper to define weight var present in each year
+weight_vars <- c("PWTA14C", "PWTA16C", "PWTA17C", "PWTA18C", "PWTA20C", "PWTA22C")
+
+# ---- Variable map ----
+var_map <- c(
+  AGE      = "age",     AGEP      = "age",
+  SEX      = "sex",
+  ILODEFR  = "emp_status",
+  REFDTE   = "ref_date",
+  ETHGR11  = "ethnicity", ETHGR3   = "ethnicity", ETHUKEUL = "ethnicity",
+  HIQUL11D = "hi_qual", HIQUL15D = "hi_qual",
+  GOR9d    = "region",   CTRY9D    = "region"
+)
+```
+
+## 1. Load & Tidy APS Waves
+
+```{r}
+
+# ---- Setup ----
+library(tidyverse)
+library(fixest)
+library(haven)
+
+# ---- Load Data ----
+lfs_js15raw <- read_dta("data_rest/five_q_longitudinal_js15-js16_eul_lgwt17.dta")
+lfs_od15raw <- read_dta("data_rest/five_q_longitudinal_od15-od16_eul_lgwt17.dta")
+
+# ---- Reshape to Long Format ----
+reshape_lfs_long <- function(df, id_var = "PERSID") {
+  quarters <- 1:5
+  df_long <- map_dfr(quarters, function(q) {
+    df %>% 
+      transmute(
+        PERSID = .data[[id_var]],
+        quarter = q,
+        age = .data[[paste0("AGE", q)]],
+        emp_status = .data[[paste0("ILODEFR", q)]],
+        weight = .data[[paste0("lgwt17")]]
+      ) %>%
+      filter(!is.na(age), !is.na(emp_status))
+  })
+  return(df_long)
+}
+
+lfs_js15 <- reshape_lfs_long(lfs_js15raw)
+lfs_od15 <- reshape_lfs_long(lfs_od15raw)
+
+# ---- Combine Panels ----
+lfs_panel <- bind_rows(lfs_js15, lfs_od15) %>% 
+  filter(between(age, 23, 27)) %>%
+  mutate(
+    treated = as.integer(age >= 25),
+    post = as.integer(quarter >= 3),  # Treat Q3+ as post-reform (e.g., Apr-Jun 2016 onward)
+    treat_post = treated * post,
+    unemployed = case_when(
+      emp_status == 2 ~ 1L,
+      emp_status %in% c(1, 3) ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+# ---- Event Study: Create Relative Time ----
+lfs_panel <- lfs_panel %>%
+  group_by(PERSID) %>%
+  mutate(rel_quarter = quarter - min(quarter)) %>%
+  ungroup()
+
+# ---- Estimate Event-Study Model ----
+es_model <- feols(
+  unemployed ~ i(rel_quarter, treated, ref = 1) | PERSID + quarter,
+  data = lfs_panel,
+  weights = ~weight,
+  cluster = ~PERSID
+)
+
+# ---- Plot Coefficients ----
+iplot(es_model, ref.line = 0,
+      xlab = "Quarters relative to reform",
+      main = "Event Study: NLW 2016 - Unemployment")
+
+# ---- Wald Test for Pre-Trends ----
+pre_vars <- grep("rel_quarter::[0-1]:treated", names(coef(es_model)), value = TRUE)
+wald(es_model, pre_vars)
+
+
+```
+
+
+```{r load-clean}
+# Function to process APS data
+process_aps_data <- function(file_path) {
+  df <- read_dta(file_path)
+  
+  # keep only variables we know about incl. weights
+  vars_keep <- intersect(names(df), c(names(var_map), weight_vars))
+  df <- df %>% select(all_of(vars_keep))
+  
+  # rename core vars - handle missing values safely
+  if (exists("var_map") && length(var_map) > 0) {
+    for (old_name in names(var_map)) {
+      new_name <- var_map[[old_name]]
+      if (!is.na(new_name) && old_name %in% names(df)) {
+        names(df)[names(df) == old_name] <- new_name
+      }
+    }
+  }
+  
+  # unify weight column
+  if (exists("weight_vars") && length(weight_vars) > 0) {
+    wt_candidates <- intersect(weight_vars, names(df))
+    if (length(wt_candidates) > 0) {
+      wt_name <- wt_candidates[1]
+      names(df)[names(df) == wt_name] <- "weight"
+    }
+  }
+  
+  # derive variables with type checking
+  df <- df %>% mutate(
+    
+    # Create employment status variables if emp_status exists
+    unemployed = if ("emp_status" %in% names(df)) {
+      case_when(
+        emp_status == 2 ~ 1L, 
+        emp_status %in% c(1, 3) ~ 0L,
+        TRUE ~ NA_integer_
+      )
+    } else {
+      NA_integer_
+    },
+    
+    inactive = if ("emp_status" %in% names(df)) {
+      case_when(
+        emp_status == 3 ~ 1L, 
+        emp_status %in% c(1, 2) ~ 0L,
+        TRUE ~ NA_integer_
+      )
+    } else {
+      NA_integer_
+    },
+    
+    # Convert age to numeric if it exists
+    age = if ("age" %in% names(df)) {
+      as.numeric(age)
+    } else {
+      NA_real_
+    },
+    
+    # Create survey_date if ref_date exists
+    survey_date = if ("ref_date" %in% names(df)) {
+      dmy(ref_date)
+    } else {
+      as.Date(NA)
+    }
+  )
+  
+  # filter ages around policy windows (18‑65)
+  required_cols <- c("age", "unemployed", "weight", "survey_date")
+  existing_cols <- intersect(required_cols, names(df))
+  
+  if (length(existing_cols) == length(required_cols)) {
+    df <- df %>% 
+      filter(
+        between(age, 18, 65), 
+        !is.na(unemployed), 
+        !is.na(weight), 
+        !is.na(survey_date)
+      )
+  } else {
+    warning("Some required columns missing, skipping filtering: ", 
+            paste(setdiff(required_cols, existing_cols), collapse = ", "))
+  }
+  
+  # clean negative codes in numeric columns
+  df <- df %>% mutate(across(where(is.numeric), ~ ifelse(.x < 0, NA, .x)))
+  
+  # create year-month factor if survey_date exists
+  if ("survey_date" %in% names(df) && !all(is.na(df$survey_date))) {
+    df <- df %>% mutate(ym = format(survey_date, "%Y-%m"))
+  }
+  
+  return(df)
+}
+
+# Process both datasets
+aps16 <- process_aps_data("data_rest/aps_3yr_jan15dec17_eul.dta")
+aps21 <- process_aps_data("data_rest/aps_3yr_jan20dec22_eul.dta")
+
+# Print summary information
+cat("APS16 observations:", nrow(aps16), "\n")
+cat("APS21 observations:", nrow(aps21), "\n")
+
+# Print column names to verify processing
+cat("APS16 columns:", paste(names(aps16), collapse = ", "), "\n")
+cat("APS21 columns:", paste(names(aps21), collapse = ", "), "\n")
+```
+
+## 2. Policy Timeline & Treatment Flags
+
+```{r policy-flags}
+policy_timeline <- tribble(
+  ~reform,      ~age_threshold, ~implementation,
+  "NLW_2016",          25,      ymd("2016‑04‑01"),
+  "NLW_2021",          23,      ymd("2021‑04‑01")
+)
+
+aps16 <- aps16 %>% mutate(
+  post_2016 = as.integer(survey_date >= ymd("2016‑04‑01")),
+
+  age_25p   = as.integer(age >= 25),
+
+  treat_2016 = post_2016 * age_25p
+)
+
+aps21 <- aps21 %>% mutate(
+  post_2021 = as.integer(survey_date >= ymd("2021‑04‑01")),
+
+  age_23p   = as.integer(age >= 23),
+
+  treat_2021 = post_2021 * age_23p
+)
+```
+
+Variable presence in the dataset test, no need to run this chunk for further analysis
+
+```{r}
+#Test for variable presence
+
+lfs_js15raw <- read_dta("data_rest/five_q_longitudinal_js15-js16_eul_lgwt17.dta")
+lfs_od15raw <- read_dta("data_rest/five_q_longitudinal_od15-od16_eul_lgwt17.dta")
+
+library(stringr)
+check_weight_stringr <- function(df) {
+  # Check column names
+  weight_names <- str_detect(names(df), regex("year", ignore_case = TRUE))
+  
+  # Check labels
+  weight_labels <- c()
+  for (col in names(df)) {
+    label <- attr(df[[col]], "label")
+    if (!is.null(label) && str_detect(label, regex("year", ignore_case = TRUE))) {
+      weight_labels <- c(weight_labels, col)
+    }
+  }
+  
+  return(list(
+    names = names(df)[weight_names],
+    labels = weight_labels
+  ))
+}
+
+check_weight_stringr(lfs_js15raw)
+check_weight_stringr(lfs_od15raw)
+
+
+get_overlapping_persids <- function(df1, df2) {
+  # Find common PERSID values
+  common_ids <- intersect(df1$PERSID, df2$PERSID)
+  
+  cat("Number of overlapping PERSID values:", length(common_ids), "\n")
+  
+  if (length(common_ids) > 0) {
+    cat("First 10 overlapping PERSID values:\n")
+    print(head(common_ids, 10))
+  } else {
+    cat("No overlapping PERSID values found.\n")
+  }
+  
+  return(common_ids)
+}
+
+get_overlapping_persids(lfs_js15raw, lfs_od15raw)
+
+```
+
+## 3. Exploratory Visualisations
+
+### Survey Timing vs. Age
+
+```{r viz-age-survey}
+ggplot(aps16, aes(x = survey_date, y = age)) +
+  geom_hex(bins = 40) +
+  geom_vline(data = policy_timeline, aes(xintercept = implementation), colour = "red", linetype = "dashed") +
+  labs(title = "APS interviews by Age and Date", x = "Survey date", y = "Age")
+```
+
+### Unemployment Rate around Threshold
+
+### Pre/post 2016
+
+```{r viz-1}
+plot_rdd <- function(data, cut_age, post_var, title) {
+  ggplot(data, aes(x = age - cut_age, y = unemployed)) +
+    stat_summary_bin(bins = 20, fun = mean) +
+    geom_vline(xintercept = 0, colour = "red", linetype = "dotted") +
+    facet_wrap(vars({{post_var}}), labeller = as_labeller(c("0"="Pre","1"="Post"))) +
+    labs(title = title, x = "Age relative to threshold", y = "Unemployment rate")
+}
+
+plot_rdd(aps16 %>% filter(between(age,18, 30)), 25, post_2016, "Visualisation: 2016 threshold (Age 25)")
+```
+
+### Pre/post 2021
+
+```{r viz-2}
+plot_rdd <- function(data, cut_age, post_var, title) {
+  ggplot(data, aes(x = age - cut_age, y = unemployed)) +
+    stat_summary_bin(bins = 20, fun = mean) +
+    geom_vline(xintercept = 0, colour = "red", linetype = "dotted") +
+    facet_wrap(vars({{post_var}}), labeller = as_labeller(c("0"="Pre","1"="Post"))) +
+    labs(title = title, x = "Age relative to threshold", y = "Unemployment rate")
+}
+
+plot_rdd(aps21 %>% filter(between(age, 18, 30)), 23, post_2021, "Visualisation: 2021 threshold (Age 23)")
+```
+
+## 4. Difference‑in‑Differences (revised to exclude already treated groups)
+
+**4.1 DiD unemployment with basic controls**
+
+```{r did-est}
+
+# using the : to keep the DiD term only since age as IV is colinear with age_25p
+did_2016 <- feols(unemployed ~ post_2016:age_25p |
+                  age + ym, data = aps16,
+                  weights = ~weight, cluster = ~ym
+                  ) 
+summary(did_2016)
+
+
+# repeat for the main 2021 age reduction
+did_2021 <- feols(unemployed ~ post_2021:age_23p |
+                  age + ym, data = aps21 %>% filter(between(age, 18, 24)), # added filter to exclude older, already treated groups
+                  weights = ~weight, cluster = ~ym
+                  )
+summary(did_2021)
+
+```
+
+**4.2 DiD unemployment with extra controls (sex, ethnicity, region and highest quali)**
+
+No significant impact on age categories beyond 2016 introduction which suggests unemployment increased for NWL cohorts compared to age groups below the threshold.
+
+#TODO: review this section, use other group closer to 25 year-olds as affected groups, review cluster applicability, etc.
+
+```{r did-est-2}
+
+did_2016 <- feols(unemployed ~ post_2016:age_25p |
+                  age + ym + sex + ethnicity + region + hi_qual,
+                  data = aps16 %>% filter(between(age, 23, 26)), weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2016)
+
+# repeat for the main 2021 age reduction
+did_2021 <- feols(unemployed ~ post_2021:age_23p |
+                  age + ym + sex + ethnicity + region  + hi_qual,
+                  data = aps21 %>% filter(between(age, 21, 24)), weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2021)
+
+
+```
+
+
+**4.3 DiD inactivity with basic controls**
+
+If spec is correct, increase in NLW appears to have reduced economic inactivity for 2016 and 2021, 2024 events.
+
+```{r did-est-3}
+
+# using the : to keep the DiD term only since age as IV is collinear with age_25p
+did_2016 <- feols(inactive ~ post_2016:age_25p |
+                  age + ym, data = aps16, weights = ~weight, cluster = ~ym
+                  ) 
+summary(did_2016)
+
+
+# repeat for the main 2021 age reduction
+did_2021 <- feols(inactive ~ post_2021:age_23p | 
+                  age + ym, data = aps21 %>% filter(between(age, 18, 24)),
+                  weights = ~weight, cluster = ~ym
+                  )
+summary(did_2021)
+```
+
+**4.4 DiD inactivity with extra controls**
+
+Similar results with extra controls in place and two way clustered standard errors around year-month and age.
+
+```{r did-est-4}
+
+did_2016 <- feols(inactive ~ post_2016:age_25p |
+                  age + ym + sex + ethnicity + region  + hi_qual,
+                  data = aps16 %>% filter(between(age, 23, 26)), weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2016)
+
+# repeat for the main 2021 age reduction
+did_2021 <- feols(inactive ~ post_2021:age_23p |
+                  age + ym + sex + ethnicity + region  + hi_qual,
+                  data = aps21 %>% filter(between(age, 21, 24)),
+                  weights = ~weight,
+                  se = "twoway", cluster = ~ym + age
+                  ) 
+summary(did_2021)
+
+
+```
+
+## 6. Event study Estimates (WiP)
+
+```{r event-est}
+## Event-study around the 2016 cut-off
+aps16 <- aps16 %>% 
+  mutate(month_rel_16 = floor(time_length(
+    survey_date - as.Date("2016-04-01"), "month")
+    )
+  )
+
+es_2016 <- feols(
+  unemployed ~ i(month_rel_16, age_25p, ref = -1:-1)| 
+    age + ym + sex + ethnicity + region  + hi_qual,
+  data     = aps16 %>% 
+    filter(between(month_rel_16, -12, 12)) %>% filter(between(age, 24, 25)),
+  weights  = ~weight,
+  se = "twoway", cluster = ~ym + age
+)
+
+iplot(es_2016, ref.line = 0,
+      xlab = "Months relative to Apr-2016",
+      main = "Event-study: unemployment gap 25+ vs <25")
+
+## Event-study around the 2021 cut-off
+aps21 <- aps21 %>% 
+  mutate(month_rel_21 = floor(time_length(
+    survey_date - as.Date("2021-04-01"), "month")
+    )
+  )
+
+es_2021 <- feols(
+  unemployed ~ i(month_rel_21, age_23p, ref = -1:-1)| 
+    age + ym + sex + ethnicity + region  + hi_qual,
+  data     = aps21 %>%
+    filter(between(month_rel_21, -12, 12)) %>% filter(between(age, 22, 23)),
+  weights  = ~weight,
+  se = "twoway", cluster = ~ym + age
+)
+
+iplot(es_2021, ref.line = 0,
+      xlab = "Months relative to Apr-2021",
+      main = "Event-study: unemployment gap 23+ vs <23")
+```
+
+6.1 Wald test
+
+```{r}
+
+# Wald Test for 2016 event pre-trend
+# Get the names of all "lead" coefficients (k < 0)
+pre_vars_16 <- grep("^month_rel_16::-[0-9]+:age_25p$",
+                    names(coef(es_2016)),
+                    value = TRUE)
+
+# Cluster-robust Wald test (inherits the vcov from es_2016)
+wald_pre_16 <- wald(es_2016, pre_vars_16)
+
+print(wald_pre_16)
+
+# Wald Test for 2021 event pre-trend
+# Get the names of all "lead" coefficients (k < 0)
+pre_vars_21 <- grep("^month_rel_21::-[0-9]+:age_23p$",
+                    names(coef(es_2021)),
+                    value = TRUE)
+
+# Cluster-robust Wald test
+wald_pre_21 <- wald(es_2021, pre_vars_21)
+
+print(wald_pre_21)
+
+```
+
+```{r}
+library(Matrix)
+
+# 1. Variance-covariance sub-matrix for the leads
+pre_vars_21 <- grep("^month_rel_21::-[0-9]+:age_23p$", names(coef(es_2021)), value = TRUE)
+V21 <- vcov(es_2021)[pre_vars_21, pre_vars_21]
+
+# 2. Check the numeric rank
+cat("rank =", rankMatrix(V21)[1], " out of ", ncol(V21), "\n")
+
+# 3. Condition number (large => near singular)
+cat("condition number =", kappa(V21), "\n")
+
+```
