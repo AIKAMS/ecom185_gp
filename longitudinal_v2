@@ -1,0 +1,239 @@
+---
+  title: "National Living Wage: Causal Impact of Age‑Eligibility Thresholds"
+author: "Group X"
+output: html_document
+---
+  
+  ```{r setup, message = FALSE, warning = FALSE}
+# ---- Packages ----
+packages <- c(
+  "tidyverse",   # data management & ggplot2
+  "lubridate",   # dates
+  "fixest",      # DiD / fixed‑effects
+  "haven"        # load .dta files
+)
+
+invisible(lapply(packages, function(p) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)))
+lapply(packages, library, character.only = TRUE)
+
+# ---- Variable map ----
+var_map <- c(
+  AGE1      = "age",     AGE2      = "age", AGE3 = "age", AGE4 = "age" , AGE5="age",
+  SEX      = "sex",
+  ILODEFR1  = "emp_status", ILODEFR2  = "emp_status", ILODEFR3  = "emp_status", ILODEFR4  = "emp_status", ILODEFR5  = "emp_status",
+  ETUKEUL1 = "ethnicity", ETUKEUL2 = "ethnicity", ETUKEUL3 = "ethnicity", ETUKEUL4 = "ethnicity", ETUKEUL5 = "ethnicity",
+  HIUL15D1 = "hi_qual", HIUL15D2 = "hi_qual", HIUL15D3 = "hi_qual", HIUL15D4 = "hi_qual", HIUL15D5 = "hi_qual",
+  URESMC1    = "region",   URESMC2    = "region", URESMC3    = "region", URESMC4    = "region", URESMC5    = "region"
+)
+```
+
+## 1. Load & Tidy APS Waves
+
+```{r}
+
+# ---- Setup ----
+library(tidyverse)
+library(fixest)
+library(haven)
+library(tools)
+library(dplyr)
+library(purrr)
+
+# Set your folder path
+folder <- "data_rest"
+
+# List all .dta files
+file_list <- list.files(folder, pattern = "\\.dta$", full.names = TRUE)
+
+# Create names based on filenames (strip extension)
+clean_names <- file_path_sans_ext(basename(file_list))
+
+# Load and name
+lfs_list <- setNames(lapply(file_list, read_dta), clean_names)
+
+# Load each file into a separate object
+list2env(lfs_list, envir = .GlobalEnv)
+
+
+## ----- Transform data -----
+# helper to define weight var present in each year
+dataset_names <- c(
+  "lfs_js14_js157_lgwt17",
+  "lfs_js15_js16_lgwt17",
+  "lfs_js16_js17_lgwt17",
+  "lfs_js17_js18_lgwt17",
+  "lfs_js18_js19_lgwt18",
+  "lfs_js19_js20_lgwt22",
+  "lfs_js20_js21_lgwt22",
+  "lfs_js21_js22_lgwt22",
+  "lfs_od13_od14_lgwt17",
+  "lfs_od14_od15_lgwt17",
+  "lfs_od15_od16_lgwt17",
+  "lfs_od16_od17_lgwt17",
+  "lfs_od17_od18_lgwt18",
+  "lfs_od18_od19_lgwt18",
+  "lfs_od19_od20_lgwt22",
+  "lfs_od20_od21_lgwt22",
+  "lfs_od21_od22_lgwt22"
+)
+
+# Extract the weight variable from the name (e.g. lgwt17)
+weight_var <- c("LGWT17", "LGWT18", "LGWT22", "lgwt17", "lgwt18", "lgwt22")
+
+# Function to check missing vars in one dataset
+check_vars <- function(df, expected_vars) {
+  expected <- toupper(names(expected_vars))
+  present <- toupper(names(df))
+  setdiff(names(expected_vars), names(df))
+}
+
+# Apply check to each dataset and name results
+missing_vars_list <- lapply(lfs_list, function(df) check_vars(df, var_map))
+
+# Assign dataset names *before* filtering
+names(missing_vars_list) <- names(lfs_list)
+
+# Keep only datasets with missing variables
+missing_vars_list <- missing_vars_list[sapply(missing_vars_list, length) > 0]
+
+# View output
+print(missing_vars_list)
+
+# Shape to long format
+reshape_lfs_long <- function(df, id_var = "PERSID", weight_var) {
+  names(df) <- toupper(names(df))
+  quarters <- 1:5
+  df_long <- map_dfr(quarters, function(q) {
+    df %>% 
+      transmute(
+        PERSID = .data[[id_var]],
+        quarter = q,
+        age = .data[[paste0("AGE", q)]],
+        emp_status = .data[[paste0("ILODEFR", q)]],
+        weight = .data[[weight_var]],
+        sex = .data[[paste0("SEX")]],
+        ethnicity = .data[[paste0("ETUKEUL", q)]],
+        region = .data[[paste0("URESMC", q)]]
+      ) %>%
+      filter(!is.na(age), !is.na(emp_status))
+  })
+  return(df_long)
+}
+
+
+# Apply reshape with correct weight per dataset
+js14 <- reshape_lfs_long(lfs_js14_js157_lgwt17, weight_var = "LGWT17")
+js15 <- reshape_lfs_long(lfs_js15_js16_lgwt17, weight_var = "LGWT17")
+js16 <- reshape_lfs_long(lfs_js16_js17_lgwt17, weight_var = "LGWT17")
+js17 <- reshape_lfs_long(lfs_js17_js18_lgwt17, weight_var = "LGWT17")
+js18 <- reshape_lfs_long(lfs_js18_js19_lgwt18, weight_var = "LGWT18")
+js19 <- reshape_lfs_long(lfs_js19_js20_lgwt22, weight_var = "LGWT22")
+js20 <- reshape_lfs_long(lfs_js20_js21_lgwt22, weight_var = "LGWT22")
+js21 <- reshape_lfs_long(lfs_js21_js22_lgwt22, weight_var = "LGWT22")
+od13 <- reshape_lfs_long(lfs_od13_od14_lgwt17, weight_var = "LGWT17")
+od14 <- reshape_lfs_long(lfs_od14_od15_lgwt17, weight_var = "LGWT17")
+od15 <- reshape_lfs_long(lfs_od15_od16_lgwt17, weight_var = "LGWT17")
+od16 <- reshape_lfs_long(lfs_od16_od17_lgwt17, weight_var = "LGWT17")
+od17 <- reshape_lfs_long(lfs_od17_od18_lgwt17, weight_var = "LGWT17")
+od18 <- reshape_lfs_long(lfs_od18_od19_lgwt18, weight_var = "LGWT18")
+od19 <- reshape_lfs_long(lfs_od19_od20_lgwt22, weight_var = "LGWT22")
+od20 <- reshape_lfs_long(lfs_od20_od21_lgwt22, weight_var = "LGWT22")
+od21 <- reshape_lfs_long(lfs_od21_od22_lgwt22, weight_var = "LGWT22")
+
+
+# combine into panels
+year <- 14:21
+
+pairs <- list(
+  list(js14, od14),
+  list(js15, od15),
+  list(js16, od16),
+  list(js17, od17),
+  list(js18, od18),
+  list(js19, od19),
+  list(js20, od20),
+  list(js21, od21)
+)
+pair_names <- paste0("Panel_", year)
+
+
+results <- purrr::map(pairs, ~ bind_rows(.x[[1]], .x[[2]]) %>% 
+                        filter(between(age, 21, 27)) %>%
+                        mutate(
+                          unemployed = case_when(
+                            emp_status == 2 ~ 1L,
+                            emp_status %in% c(1, 3) ~ 0L,
+                            TRUE ~ NA_integer_
+                          ),
+                          inactive = case_when(
+                            emp_status == 3 ~ 1L, 
+                            emp_status %in% c(1, 2) ~ 0L)
+                        )) %>%
+  purrr::set_names(pair_names)
+
+list2env(results, envir = .GlobalEnv)
+
+for (y in year) {
+  df_name <- paste0("Panel_", y)
+  df <- get(df_name) %>%
+    group_by(PERSID) %>%
+    mutate(rel_quarter = quarter - min(quarter)) %>%
+    ungroup()
+  
+  assign(df_name, df)
+  
+  df_summary <- df %>%
+    filter(!is.na(unemployed), !is.na(PERSID)) %>%
+    group_by(age, ethnicity, sex, region, quarter, rel_quarter) %>%
+    summarise(
+      unemployment_rate = weighted.mean(unemployed, weight, age, na.rm=TRUE),
+      inactivity_rate = weighted.mean(inactive, weight, age, na.rm=TRUE),
+      .groups = "drop"
+      ) %>%
+    mutate(year = y, quarter_year = paste0("Q", quarter, "_", y))
+  
+  assign(paste0("Summary_", y), df_summary)
+}
+
+## FORM FULL DATASET
+
+dfs <- mget(paste0("Summary_", year))
+combined_df <- bind_rows(dfs)
+combined_df <- combined_df %>%
+  mutate(rel_quarter_yr = paste(rel_quarter, year, sep = "_"))
+
+
+## dummy variables
+
+combined_df <- combined_df %>%
+  mutate(
+    year_num = as.numeric(sub("Q\\d_(\\d+)", "\\1", quarter_year)),
+    quarter_num = as.numeric(sub("Q(\\d)_\\d+", "\\1", quarter_year))
+  ) %>%
+  arrange(year_num, quarter_num) %>%
+  mutate(
+    quarter_year = factor(quarter_year, levels = unique(quarter_year), ordered = TRUE),
+    post_2016 = if_else(quarter_year >= "Q3_16", 1, 0),
+    post_2021 = if_else(quarter_year >= "Q3_21", 1, 0),
+    
+    age_25 = if_else(age >= 25, 1, 0),
+    age_23 = if_else(between(age, 23, 24), 1, 0))
+
+# Mean outcome by group and time
+# Plot pre-treatment trends
+pre_treatment <- combined_df %>%
+  filter(post_2016 == 0 & post_2021 == 0) %>%
+  mutate(group = case_when(
+    age_25 == 1 ~ "age_25",
+    age_23 == 1 ~ "age_23",
+    TRUE ~ "control"
+  )) %>%
+  group_by(group, quarter_year) %>%
+  summarise(mean_unemployment = mean(unemployment_rate, na.rm = TRUE), .groups = "drop")
+
+ggplot(pre_treatment, aes(x = quarter_year, y = mean_unemployment, color = group, group = group)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Pre-treatment Parallel Trends: Unemployment",
+       x = "Time", y = "Mean Unemployment") +
+  theme_minimal()
