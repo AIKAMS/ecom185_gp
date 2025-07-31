@@ -173,6 +173,8 @@ results <- purrr::map(pairs, ~ bind_rows(.x[[1]], .x[[2]]) %>%
 
 list2env(results, envir = .GlobalEnv)
 
+## weighting the outcomes so we can merge the datasets together
+
 for (y in year) {
   df_name <- paste0("Panel_", y)
   df <- get(df_name) %>%
