@@ -203,7 +203,7 @@ combined_df <- combined_df %>%
   mutate(rel_quarter_yr = paste(rel_quarter, year, sep = "_"))
 
 
-## dummy variables
+## create dummy variables
 
 combined_df <- combined_df %>%
   mutate(
@@ -219,7 +219,6 @@ combined_df <- combined_df %>%
     age_25 = if_else(age >= 25, 1, 0),
     age_23 = if_else(between(age, 23, 24), 1, 0))
 
-# Mean outcome by group and time
 # Plot pre-treatment trends
 pre_treatment <- combined_df %>%
   filter(post_2016 == 0 & post_2021 == 0) %>%
